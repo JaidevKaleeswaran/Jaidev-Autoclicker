@@ -153,7 +153,9 @@ def on_release(key):
     global hotkey_pressed
     k = normalize_key(key)
     pressed_keys.discard(k)
-    if k in hotkey_combo:
+    # Only clear the latch once the ENTIRE combo is lifted,
+    # so OS key-repeat can never fire a second spurious toggle.
+    if hotkey_pressed and not hotkey_combo.issubset(pressed_keys):
         hotkey_pressed = False
 
 
@@ -175,13 +177,14 @@ def set_hotkey():
     root.focus()
     temp_win = tk.Toplevel(root)
     temp_win.title("Set Hotkey")
-    temp_win.geometry("300x130")
+    temp_win.geometry("300x160")
     temp_win.resizable(False, False)
     temp_win.focus_force()
-    tk.Label(temp_win, text="Press your hotkey combo…", font=("Arial", 12)).pack(pady=12)
+    tk.Label(temp_win, text="Press your hotkey combo…", font=("Arial", 12)).pack(pady=10)
     display_var = tk.StringVar(value="—")
     tk.Label(temp_win, textvariable=display_var, font=("Arial", 11, "bold")).pack()
-    keys_pressed_temp = set()
+    keys_held = set()       # keys currently down
+    pending_combo = set()   # last fully-held combo
 
     def clean_key(sym):
         sym = sym.upper()
@@ -192,20 +195,26 @@ def set_hotkey():
         return sym
 
     def on_key(event):
-        keys_pressed_temp.add(clean_key(event.keysym))
-        display_var.set("+".join(sorted(keys_pressed_temp)))
+        keys_held.add(clean_key(event.keysym))
+        pending_combo.clear()
+        pending_combo.update(keys_held)
+        display_var.set("+".join(sorted(pending_combo)))
 
     def on_key_release(event):
+        keys_held.discard(clean_key(event.keysym))
+
+    def confirm():
         global hotkey_combo
-        if keys_pressed_temp:
-            hotkey_combo = set(keys_pressed_temp)
+        if pending_combo:
+            hotkey_combo = set(pending_combo)
             hotkey_display_var.set("Hotkey: " + "+".join(sorted(hotkey_combo)))
-            keys_pressed_temp.clear()
             pressed_keys.clear()
             temp_win.destroy()
 
-    temp_win.bind_all("<KeyPress>", on_key)
+    temp_win.bind_all("<KeyPress>",   on_key)
     temp_win.bind_all("<KeyRelease>", on_key_release)
+    tk.Button(temp_win, text="SET", command=confirm, width=10,
+              font=("Arial", 11, "bold"), bg="#0055cc", fg="white").pack(pady=10)
 
 
 root = tk.Tk()
