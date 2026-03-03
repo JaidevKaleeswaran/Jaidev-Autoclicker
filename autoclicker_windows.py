@@ -1,8 +1,42 @@
 import time
 import threading
+import ctypes
+import ctypes.wintypes as _wt
 import tkinter as tk
 from tkinter import messagebox
 from pynput import mouse, keyboard
+
+# ── Win32 SendInput fast-path: direct click injection, bypasses pynput ─────────
+try:
+    class _MOUSEINPUT(ctypes.Structure):
+        _fields_ = [("dx", _wt.LONG), ("dy", _wt.LONG),
+                    ("mouseData", _wt.DWORD), ("dwFlags", _wt.DWORD),
+                    ("time", _wt.DWORD), ("dwExtraInfo", ctypes.POINTER(_wt.ULONG))]
+    class _INPUT(ctypes.Structure):
+        _fields_ = [("type", _wt.DWORD), ("mi", _MOUSEINPUT)]
+    _LDOWN = _INPUT(type=0, mi=_MOUSEINPUT(dwFlags=0x0002))
+    _LUP   = _INPUT(type=0, mi=_MOUSEINPUT(dwFlags=0x0004))
+    _SI    = ctypes.sizeof(_INPUT)
+    _send  = ctypes.windll.user32.SendInput
+    def _win_press():   _send(1, ctypes.byref(_LDOWN), _SI)
+    def _win_release(): _send(1, ctypes.byref(_LUP),   _SI)
+    _USE_WINSEND = True
+    # Raise Windows timer resolution to 1 ms for accurate sleep
+    try: ctypes.windll.winmm.timeBeginPeriod(1)
+    except Exception: pass
+except Exception:
+    _USE_WINSEND = False
+
+# ── Hybrid sleep: OS sleep + micro-spin for the final 1 ms ───────────────────
+_SPIN = 0.001
+def _precise_sleep(dt):
+    if dt <= 0:
+        return
+    if dt > _SPIN:
+        time.sleep(dt - _SPIN)
+    end = time.perf_counter() + dt
+    while time.perf_counter() < end:
+        pass
 
 running = False
 click_thread = None
@@ -16,18 +50,38 @@ pynput_btn = mouse.Button.left
 
 
 def click_loop(cps, duty):
-    period = max(0.0001, 1.0 / cps)
-    duty_frac = max(0.0, min(1.0, duty / 100.0))
-    down_time = period * duty_frac
-    up_time = period - down_time
-    while not stop_event.is_set():
-        mouse_controller.press(pynput_btn)
+    period    = max(0.0001, 1.0 / cps)
+    down_time = period * max(0.0, min(1.0, duty / 100.0))
+
+    # Choose fastest available click backend
+    if _USE_WINSEND:
+        press, release = _win_press, _win_release
+    else:
+        _btn = pynput_btn
+        _mc  = mouse_controller
+        press   = lambda: _mc.press(_btn)
+        release = lambda: _mc.release(_btn)
+
+    # Pre-bind hot-path symbols to locals (avoids global/attr lookup each iteration)
+    stop_is_set = stop_event.is_set
+    sleep       = _precise_sleep
+    perf        = time.perf_counter
+    after       = root.after
+
+    next_tick = perf()
+    while not stop_is_set():
+        now = perf()
+        if now > next_tick + period:   # skip missed ticks; don't burst
+            next_tick = now
+        sleep(next_tick - now)
+        if stop_is_set():
+            break
+        press()
         if down_time > 0:
-            time.sleep(down_time)
-        mouse_controller.release(pynput_btn)
-        if up_time > 0:
-            time.sleep(up_time)
-    root.after(0, lambda: status_var.set("Status: STOPPED"))
+            sleep(down_time)
+        release()
+        next_tick += period
+    after(0, lambda: status_var.set("Status: STOPPED"))
 
 
 def start_clicking():

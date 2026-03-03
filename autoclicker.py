@@ -5,6 +5,35 @@ from tkinter import messagebox
 from pynput import mouse, keyboard
 import subprocess
 
+# ── Quartz fast-path: direct OS-level click injection (lower latency than pynput) ──
+try:
+    import Quartz as _Q
+    _cg_src = _Q.CGEventSourceCreate(_Q.kCGEventSourceStateHIDSystemState)
+    _kDown  = _Q.kCGEventLeftMouseDown
+    _kUp    = _Q.kCGEventLeftMouseUp
+    _kBtn   = _Q.kCGMouseButtonLeft
+    _kTap   = _Q.kCGHIDEventTap
+    def _quartz_press():
+        pos = _Q.CGEventGetLocation(_Q.CGEventCreate(None))
+        _Q.CGEventPost(_kTap, _Q.CGEventCreateMouseEvent(_cg_src, _kDown, pos, _kBtn))
+    def _quartz_release():
+        pos = _Q.CGEventGetLocation(_Q.CGEventCreate(None))
+        _Q.CGEventPost(_kTap, _Q.CGEventCreateMouseEvent(_cg_src, _kUp,   pos, _kBtn))
+    _USE_QUARTZ = True
+except Exception:
+    _USE_QUARTZ = False
+
+# ── Hybrid sleep: OS sleep + micro-spin for the final 0.5 ms ──────────────────────
+_SPIN = 0.0005
+def _precise_sleep(dt):
+    if dt <= 0:
+        return
+    if dt > _SPIN:
+        time.sleep(dt - _SPIN)
+    end = time.perf_counter() + dt
+    while time.perf_counter() < end:
+        pass
+
 running = False
 click_thread = None
 stop_event = threading.Event()
@@ -17,18 +46,38 @@ pynput_btn = mouse.Button.left
 
 
 def click_loop(cps, duty):
-    period = max(0.0001, 1.0 / cps)
-    duty_frac = max(0.0, min(1.0, duty / 100.0))
-    down_time = period * duty_frac
-    up_time = period - down_time
-    while not stop_event.is_set():
-        mouse_controller.press(pynput_btn)
+    period    = max(0.0001, 1.0 / cps)
+    down_time = period * max(0.0, min(1.0, duty / 100.0))
+
+    # Choose fastest available click backend
+    if _USE_QUARTZ:
+        press, release = _quartz_press, _quartz_release
+    else:
+        _btn = pynput_btn
+        _mc  = mouse_controller
+        press   = lambda: _mc.press(_btn)
+        release = lambda: _mc.release(_btn)
+
+    # Pre-bind hot-path symbols to locals (avoids global/attr lookup each iteration)
+    stop_is_set  = stop_event.is_set
+    sleep        = _precise_sleep
+    perf         = time.perf_counter
+    after        = root.after
+
+    next_tick = perf()
+    while not stop_is_set():
+        now = perf()
+        if now > next_tick + period:   # skip missed ticks; don't burst
+            next_tick = now
+        sleep(next_tick - now)
+        if stop_is_set():
+            break
+        press()
         if down_time > 0:
-            time.sleep(down_time)
-        mouse_controller.release(pynput_btn)
-        if up_time > 0:
-            time.sleep(up_time)
-    root.after(0, lambda: status_var.set("Status: STOPPED"))
+            sleep(down_time)
+        release()
+        next_tick += period
+    after(0, lambda: status_var.set("Status: STOPPED"))
 
 
 def start_clicking():
