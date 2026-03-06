@@ -8,36 +8,49 @@ import subprocess
 # ── Quartz fast-path: direct OS-level click injection (lower latency than pynput) ──
 try:
     import Quartz as _Q
-    _cg_src = _Q.CGEventSourceCreate(_Q.kCGEventSourceStateHIDSystemState)
-    _kDown  = _Q.kCGEventLeftMouseDown
-    _kUp    = _Q.kCGEventLeftMouseUp
-    _kBtn   = _Q.kCGMouseButtonLeft
-    _kTap   = _Q.kCGHIDEventTap
+
+    # kCGEventSourceStatePrivate: our events don't pollute the global HID state
+    _cg_src  = _Q.CGEventSourceCreate(_Q.kCGEventSourceStatePrivate)
+    _kDown   = _Q.kCGEventLeftMouseDown
+    _kUp     = _Q.kCGEventLeftMouseUp
+    _kBtn    = _Q.kCGMouseButtonLeft
+    # kCGSessionEventTap posts at session priority — same level as real hardware
+    # events, NOT above them. This prevents injected clicks from queue-jumping
+    # real mouse-move events, which is what caused movement delay in-game.
+    _kTap    = _Q.kCGSessionEventTap
+
+    # Pre-allocate one reusable event object per button state.
+    # We update its position each tick instead of allocating on every click.
+    # This halves allocations vs original (1 per click instead of 2).
+    _origin  = _Q.CGPointMake(0, 0)
+    _ev_down = _Q.CGEventCreateMouseEvent(_cg_src, _kDown, _origin, _kBtn)
+    _ev_up   = _Q.CGEventCreateMouseEvent(_cg_src, _kUp,   _origin, _kBtn)
+
     def _quartz_press():
+        # CGEventCreate(None) fetches the LIVE cursor position each call.
+        # We can't cache this — a cached event's position never updates.
         pos = _Q.CGEventGetLocation(_Q.CGEventCreate(None))
-        _Q.CGEventPost(_kTap, _Q.CGEventCreateMouseEvent(_cg_src, _kDown, pos, _kBtn))
+        _Q.CGEventSetLocation(_ev_down, pos)
+        _Q.CGEventPost(_kTap, _ev_down)
+
     def _quartz_release():
         pos = _Q.CGEventGetLocation(_Q.CGEventCreate(None))
-        _Q.CGEventPost(_kTap, _Q.CGEventCreateMouseEvent(_cg_src, _kUp,   pos, _kBtn))
+        _Q.CGEventSetLocation(_ev_up, pos)
+        _Q.CGEventPost(_kTap, _ev_up)
+
     _USE_QUARTZ = True
 except Exception:
     _USE_QUARTZ = False
 
-# ── Hybrid sleep: OS sleep + micro-spin for the final 0.5 ms ──────────────────────
-_SPIN = 0.0005
+# ── Precise sleep: plain OS sleep is accurate enough on macOS (±0.5 ms) ──────────
 def _precise_sleep(dt):
-    if dt <= 0:
-        return
-    if dt > _SPIN:
-        time.sleep(dt - _SPIN)
-    end = time.perf_counter() + dt
-    while time.perf_counter() < end:
-        pass
+    if dt > 0:
+        time.sleep(dt)
 
 running = False
 click_thread = None
 stop_event = threading.Event()
-hotkey_combo = set()
+hotkey_combo = {"SHIFT", "Q"}
 pressed_keys = set()
 hotkey_pressed = False
 is_typing = False
@@ -62,7 +75,6 @@ def click_loop(cps, duty):
     stop_is_set  = stop_event.is_set
     sleep        = _precise_sleep
     perf         = time.perf_counter
-    after        = root.after
 
     next_tick = perf()
     while not stop_is_set():
@@ -77,7 +89,7 @@ def click_loop(cps, duty):
             sleep(down_time)
         release()
         next_tick += period
-    after(0, lambda: status_var.set("Status: STOPPED"))
+    root.after(0, lambda: status_var.set("Status: STOPPED"))
 
 
 def start_clicking():
@@ -239,19 +251,19 @@ PAD = {"padx": 16, "pady": 6}
 
 tk.Label(root, text="CPS (Clicks Per Second):", anchor="w").pack(fill="x", **PAD)
 cps_entry = tk.Entry(root, font=("Arial", 12))
-cps_entry.insert(0, "54.53")
+cps_entry.insert(0, "115.25")
 cps_entry.pack(fill="x", padx=16)
 cps_entry.bind("<FocusIn>", on_entry_focus_in)
 cps_entry.bind("<FocusOut>", on_entry_focus_out)
 
 tk.Label(root, text="Duty Cycle (0 – 100%):", anchor="w").pack(fill="x", **PAD)
 duty_entry = tk.Entry(root, font=("Arial", 12))
-duty_entry.insert(0, "18.37")
+duty_entry.insert(0, "42.55")
 duty_entry.pack(fill="x", padx=16)
 duty_entry.bind("<FocusIn>", on_entry_focus_in)
 duty_entry.bind("<FocusOut>", on_entry_focus_out)
 
-hotkey_display_var = tk.StringVar(value="Hotkey: NONE")
+hotkey_display_var = tk.StringVar(value="Hotkey: Q+SHIFT")
 tk.Label(root, textvariable=hotkey_display_var, fg="#0055cc", font=("Arial", 11)).pack(**PAD)
 
 tk.Button(root, text="Set Hotkey", command=set_hotkey, width=14).pack(pady=4)
